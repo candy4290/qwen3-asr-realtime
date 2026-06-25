@@ -1,0 +1,6 @@
+# Qwen3-ASR 实时 WebSocket 服务依赖（Web 层）
+# ASR 推理栈请先在 Conda 环境中安装：pip install -U qwen-asr[vllm]
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic-settings>=2.6.0
+numpy>=1.26.0

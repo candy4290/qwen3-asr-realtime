@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<!--
+  static/demo.html — Qwen3-ASR Realtime WebSocket 浏览器测试页。
+
+  功能：
+  - 采集麦克风并重采样到 16kHz 单声道 PCM16
+  - 通过 WebSocket 发送 session.update / append / commit 事件
+  - 展示 transcription.delta / done 累计识别结果
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Qwen3-ASR Realtime Demo</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #4ade80;
+      --err: #f87171;
+      --border: #334155;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .card {
+      max-width: 720px;
+      margin: 0 auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 16px; }
+    label { font-size: 0.85rem; color: var(--muted); display: block; margin-bottom: 4px; }
+    input, select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      margin-bottom: 12px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    button {
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .primary { background: var(--accent); color: #0f172a; }
+    .danger { background: var(--err); color: #fff; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .pill.ok { color: var(--ok); border-color: var(--ok); }
+    .pill.err { color: var(--err); border-color: var(--err); }
+    #text {
+      min-height: 120px;
+      white-space: pre-wrap;
+      line-height: 1.6;
+      padding: 12px;
+      background: var(--bg);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    #log {
+      margin-top: 12px;
+      font-size: 0.75rem;
+      color: var(--muted);
+      max-height: 160px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Qwen3-ASR Realtime Demo</h1>
+
+    <label>WebSocket URL</label>
+    <input id="wsUrl" type="text" value="" />
+
+    <label>Language（可选）</label>
+    <input id="language" type="text" placeholder="Chinese / English，留空自动检测" />
+
+    <div class="row">
+      <button id="btnStart" class="primary">开始识别</button>
+      <button id="btnStop" class="danger" disabled>停止（commit true）</button>
+    </div>
+
+    <p>状态：<span id="status" class="pill">未连接</span></p>
+    <p>语种：<span id="lang">—</span></p>
+
+    <label>识别文本（累计）</label>
+    <div id="text"></div>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    (() => {
+      const $ = (id) => document.getElementById(id);
+      const wsUrlEl = $("wsUrl");
+      const languageEl = $("language");
+      const btnStart = $("btnStart");
+      const btnStop = $("btnStop");
+      const statusEl = $("status");
+      const langEl = $("lang");
+      const textEl = $("text");
+      const logEl = $("log");
+
+      const TARGET_SR = 16000;
+      const CHUNK_MS = 500;
+
+      // 默认 WS 地址
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      wsUrlEl.value = `${proto}//${location.host}/v1/realtime`;
+
+      let ws = null;
+      let audioCtx = null;
+      let processor = null;
+      let source = null;
+      let mediaStream = null;
+      let running = false;
+      let buf = new Float32Array(0);
+      let pushing = false;
+
+      /** 写日志到页面底部 */
+      function log(msg) {
+        const line = document.createElement("div");
+        line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        logEl.prepend(line);
+      }
+
+      /** 更新状态 pill */
+      function setStatus(text, cls) {
+        statusEl.textContent = text;
+        statusEl.className = "pill " + (cls || "");
+      }
+
+      /** 拼接 float32 数组 */
+      function concatFloat32(a, b) {
+        const out = new Float32Array(a.length + b.length);
+        out.set(a, 0);
+        out.set(b, a.length);
+        return out;
+      }
+
+      /** 线性重采样到 16kHz */
+      function resampleLinear(input, srcSr, dstSr) {
+        if (srcSr === dstSr) return input;
+        const ratio = dstSr / srcSr;
+        const outLen = Math.max(0, Math.round(input.length * ratio));
+        const out = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const x = i / ratio;
+          const x0 = Math.floor(x);
+          const x1 = Math.min(x0 + 1, input.length - 1);
+          const t = x - x0;
+          out[i] = input[x0] * (1 - t) + input[x1] * t;
+        }
+        return out;
+      }
+
+      /** float32 [-1,1] 转 PCM16 base64 */
+      function float32ToPcm16Base64(float32) {
+        const int16 = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          const s = Math.max(-1, Math.min(1, float32[i]));
+          int16[i] = s < 0 ? s * 32768 : s * 32767;
+        }
+        const bytes = new Uint8Array(int16.buffer);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        return btoa(binary);
+      }
+
+      /** 发送 JSON 事件 */
+      function send(event) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(event));
+        }
+      }
+
+      /** 推送 append 队列 */
+      async function pump() {
+        if (pushing) return;
+        pushing = true;
+        const chunkSamples = Math.round(TARGET_SR * (CHUNK_MS / 1000));
+        try {
+          while (running && buf.length >= chunkSamples) {
+            const chunk = buf.slice(0, chunkSamples);
+            buf = buf.slice(chunkSamples);
+            send({
+              type: "input_audio_buffer.append",
+              audio: float32ToPcm16Base64(chunk),
+            });
+            // 每包 append 后 commit(false) 获取中间识别结果
+            send({ type: "input_audio_buffer.commit", final: false });
+          }
+        } finally {
+          pushing = false;
+        }
+      }
+
+      /** 停止音频管线 */
+      async function stopAudio() {
+        try {
+          if (processor) { processor.disconnect(); processor.onaudioprocess = null; }
+          if (source) source.disconnect();
+          if (audioCtx) await audioCtx.close();
+          if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
+        } catch (_) {}
+        processor = null;
+        source = null;
+        audioCtx = null;
+        mediaStream = null;
+      }
+
+      /** 处理服务端消息 */
+      function onMessage(ev) {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        log(`← ${msg.type}`);
+
+        if (msg.type === "transcription.delta" || msg.type === "transcription.done") {
+          langEl.textContent = msg.language || "—";
+          textEl.textContent = msg.text || "";
+        }
+        if (msg.type === "error") {
+          setStatus(msg.error || "错误", "err");
+          log(`ERROR: ${msg.code} ${msg.error}`);
+        }
+      }
+
+      btnStart.onclick = async () => {
+        if (running) return;
+        textEl.textContent = "";
+        langEl.textContent = "—";
+        buf = new Float32Array(0);
+
+        try {
+          setStatus("连接中…", "");
+          ws = new WebSocket(wsUrlEl.value);
+          ws.onmessage = onMessage;
+          ws.onerror = () => setStatus("WS 错误", "err");
+
+          await new Promise((resolve, reject) => {
+            ws.onopen = resolve;
+            ws.onclose = () => reject(new Error("连接关闭"));
+            setTimeout(() => reject(new Error("连接超时")), 10000);
+          });
+
+          await new Promise((resolve) => {
+            const handler = (ev) => {
+              const m = JSON.parse(ev.data);
+              if (m.type === "session.created") {
+                ws.removeEventListener("message", handler);
+                log(`session ${m.id}`);
+                resolve();
+              }
+            };
+            ws.addEventListener("message", handler);
+          });
+
+          const lang = languageEl.value.trim();
+          send({
+            type: "session.update",
+            language: lang || null,
+            hotwords: "",
+            chunk_size_sec: 1.0,
+            unfixed_chunk_num: 2,
+            unfixed_token_num: 5,
+          });
+
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+            video: false,
+          });
+
+          audioCtx = new AudioContext();
+          source = audioCtx.createMediaStreamSource(mediaStream);
+          processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+          processor.onaudioprocess = (e) => {
+            if (!running) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const resampled = resampleLinear(input, audioCtx.sampleRate, TARGET_SR);
+            buf = concatFloat32(buf, resampled);
+            if (!pushing) pump();
+          };
+
+          source.connect(processor);
+          processor.connect(audioCtx.destination);
+
+          running = true;
+          btnStart.disabled = true;
+          btnStop.disabled = false;
+          setStatus("识别中…", "ok");
+        } catch (err) {
+          setStatus(String(err.message || err), "err");
+          running = false;
+          await stopAudio();
+          if (ws) ws.close();
+        }
+      };
+
+      btnStop.onclick = async () => {
+        if (!running) return;
+        running = false;
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+        setStatus("收尾中…", "");
+
+        await stopAudio();
+
+        // 剩余缓冲作为 append 发送后 commit(true)
+        if (buf.length > 0) {
+          send({
+            type: "input_audio_buffer.append",
+            audio: float32ToPcm16Base64(buf),
+          });
+          buf = new Float32Array(0);
+        }
+        send({ type: "input_audio_buffer.commit", final: true });
+
+        setStatus("已停止", "");
+        setTimeout(() => { if (ws) ws.close(); ws = null; }, 2000);
+      };
+    })();
+  </script>
+</body>
+</html>
