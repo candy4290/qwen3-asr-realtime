@@ -52,13 +52,14 @@ async def _engine_watchdog(asr: QwenStreamingAdapter, interval_sec: float) -> No
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    应用生命周期：启动时加载 ASR 模型，关闭时记录日志。
+    应用生命周期：启动时加载 ASR 模型并预热，关闭时记录日志。
 
     Args:
         app: FastAPI 应用实例。
     """
     asr = QwenStreamingAdapter()
     asr.load(settings)
+    await asr.warmup(settings)
     app.state.asr = asr
     app.state.session_manager = SessionManager()
 

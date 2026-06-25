@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -121,6 +122,46 @@ class QwenStreamingAdapter:
             max_new_tokens=settings.max_new_tokens,
         )
         logger.info("ASR 模型加载完成")
+
+    async def warmup(self, settings: Settings) -> None:
+        """
+        启动预热：用静音音频跑一遍流式推理，触发 vLLM/CUDA 冷启动。
+
+        在 load() 之后、接受真实请求之前调用，避免首个用户承担首次 generate 延迟。
+        预热失败仅记录警告，不阻断服务启动。
+
+        Args:
+            settings: 应用配置，用于对齐默认 chunk 参数。
+        """
+        self._ensure_loaded()
+
+        chunk_sec = settings.default_chunk_size_sec
+        unfixed_chunks = settings.default_unfixed_chunk_num
+        # 攒够 unfixed_chunk_num 个满 chunk，覆盖前几步流式 decode
+        total_samples = int(round(chunk_sec * unfixed_chunks * 16000))
+        dummy = np.zeros(total_samples, dtype=np.float32)
+
+        config = SessionAsrConfig(
+            chunk_size_sec=chunk_sec,
+            unfixed_chunk_num=unfixed_chunks,
+            unfixed_token_num=settings.default_unfixed_token_num,
+        )
+        state = self.init_state(config)
+
+        logger.info(
+            "正在预热 ASR 引擎（静音 %.1fs × %d chunk）…",
+            chunk_sec,
+            unfixed_chunks,
+        )
+        t0 = time.perf_counter()
+        try:
+            await self.transcribe(dummy, state)
+            await self.finish(state)
+        except Exception:
+            logger.warning("ASR 引擎预热失败（不影响启动，首个请求可能较慢）", exc_info=True)
+            return
+
+        logger.info("ASR 引擎预热完成，耗时 %.2fs", time.perf_counter() - t0)
 
     def init_state(self, config: SessionAsrConfig) -> Any:
         """
