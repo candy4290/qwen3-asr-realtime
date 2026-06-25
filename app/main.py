@@ -9,8 +9,9 @@ app/main.py — FastAPI 应用入口。
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
@@ -18,6 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.asr.adapter import QwenStreamingAdapter
+from app.asr.engine_watchdog import fatal_shutdown, is_vllm_engine_alive
 from app.config import settings
 from app.session.manager import SessionManager
 from app.ws.handler import realtime_websocket
@@ -34,6 +36,19 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = ROOT_DIR / "static"
 
 
+async def _engine_watchdog(asr: QwenStreamingAdapter, interval_sec: float) -> None:
+    """
+    后台轮询 vLLM EngineCore 存活状态；检测到退出则终止整个进程。
+
+    vLLM 内部已有 MPClientEngineMonitor 线程维护 engine_dead 标志，
+    此处仅做周期性读取，避免 FastAPI 在 EngineCore 挂掉后继续空转。
+    """
+    while True:
+        await asyncio.sleep(interval_sec)
+        if not asr.is_engine_alive:
+            fatal_shutdown("vLLM EngineCore 已退出")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -46,8 +61,32 @@ async def lifespan(app: FastAPI):
     asr.load(settings)
     app.state.asr = asr
     app.state.session_manager = SessionManager()
+
+    watchdog_task: asyncio.Task | None = None
+    if settings.engine_watchdog_interval_sec > 0:
+        engine_pids = asr.monitored_engine_pids()
+        if engine_pids:
+            logger.info(
+                "EngineCore watchdog 已启动，检测间隔 %.1fs，监控本实例子进程 PID: %s",
+                settings.engine_watchdog_interval_sec,
+                engine_pids,
+            )
+        else:
+            logger.info(
+                "EngineCore watchdog 已启动，检测间隔 %.1fs（通过 engine_dead 标志检测）",
+                settings.engine_watchdog_interval_sec,
+            )
+        watchdog_task = asyncio.create_task(
+            _engine_watchdog(asr, settings.engine_watchdog_interval_sec)
+        )
+
     logger.info("服务已启动，监听 %s:%s", settings.host, settings.port)
     yield
+
+    if watchdog_task is not None:
+        watchdog_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await watchdog_task
     logger.info("服务正在关闭")
 
 
@@ -73,8 +112,9 @@ async def health():
     asr: QwenStreamingAdapter = app.state.asr
     manager: SessionManager = app.state.session_manager
     return {
-        "status": "ok",
+        "status": "ok" if asr.is_engine_alive else "engine_dead",
         "model_loaded": asr.is_loaded,
+        "engine_alive": asr.is_engine_alive,
         "active_sessions": manager.active_count,
     }
 

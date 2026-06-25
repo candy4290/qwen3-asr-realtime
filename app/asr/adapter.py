@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from app.asr.engine_watchdog import fatal_shutdown, get_monitored_engine_pids, is_vllm_engine_alive
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -44,11 +45,32 @@ class QwenStreamingAdapter:
         """初始化适配器；模型在 load() 中延迟加载。"""
         self._model: Any = None
         self._infer_lock = asyncio.Lock()
+        self._engine_dead = False
 
     @property
     def is_loaded(self) -> bool:
         """模型是否已成功加载。"""
         return self._model is not None
+
+    @property
+    def is_engine_alive(self) -> bool:
+        """vLLM EngineCore 是否仍在运行。"""
+        if self._engine_dead or self._model is None:
+            return False
+        return is_vllm_engine_alive(self._model)
+
+    def mark_engine_dead(self, reason: str) -> None:
+        """标记 EngineCore 已失效并终止整个进程。"""
+        if self._engine_dead:
+            return
+        self._engine_dead = True
+        fatal_shutdown(f"vLLM EngineCore 不可用: {reason}")
+
+    def monitored_engine_pids(self) -> list[int]:
+        """本 load 拉起的 EngineCore 子进程 PID（非系统级扫描）。"""
+        if self._model is None:
+            return []
+        return get_monitored_engine_pids(self._model)
 
     def _check_vllm_version(self) -> None:
         """
@@ -133,7 +155,12 @@ class QwenStreamingAdapter:
             return
         self._ensure_loaded()
         async with self._infer_lock:
-            await asyncio.to_thread(self._model.streaming_transcribe, pcm, state)
+            try:
+                await asyncio.to_thread(self._model.streaming_transcribe, pcm, state)
+            except Exception as exc:
+                if _is_engine_dead_error(exc):
+                    self.mark_engine_dead(str(exc))
+                raise
 
     async def finish(self, state: Any) -> None:
         """
@@ -146,9 +173,26 @@ class QwenStreamingAdapter:
         """
         self._ensure_loaded()
         async with self._infer_lock:
-            await asyncio.to_thread(self._model.finish_streaming_transcribe, state)
+            try:
+                await asyncio.to_thread(
+                    self._model.finish_streaming_transcribe, state
+                )
+            except Exception as exc:
+                if _is_engine_dead_error(exc):
+                    self.mark_engine_dead(str(exc))
+                raise
 
     def _ensure_loaded(self) -> None:
         """确认模型已加载，否则抛出 RuntimeError。"""
         if self._model is None:
             raise RuntimeError("ASR 模型尚未加载")
+
+
+def _is_engine_dead_error(exc: BaseException) -> bool:
+    """判断异常是否由 vLLM EngineCore 退出引起。"""
+    name = type(exc).__name__
+    if name == "EngineDeadError":
+        return True
+    # vLLM 有时会将 EngineDeadError 包装在其他异常里
+    cause = exc.__cause__
+    return cause is not None and type(cause).__name__ == "EngineDeadError"

@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     # HTTP / WebSocket 监听地址
     host: str = "0.0.0.0"
     port: int = 9800
+    # vLLM EngineCore 存活检测间隔（秒）；≤0 表示关闭 watchdog
+    engine_watchdog_interval_sec: float = 5.0
 
     # 为 True 时设置 HF_HUB_OFFLINE=1，仅从本地 HuggingFace 缓存加载模型
     hf_hub_offline: bool = False
